@@ -8,7 +8,7 @@ Last Updated: 2/28/2016
 
 
 =======================================
-Updated by COrnel du Preez 7/16/2018
+Updated by Cornel du Preez 7/16/2018
 =======================================
 
 Description:  Interactive script that connects to a specified Nessus 6 server using the
