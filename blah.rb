@@ -1,48 +1,47 @@
 #!/usr/bin/env ruby
 #################################################################################################
-# Name: Nessus Report Downloader
+# Name: Nessus 6 Report Downloader
 # Author: Travis Lee
 #
-# Version: 1.01
-# Last Updated: 3/14/2014
+# Version: 1.0
+# Last Updated: 2/28/2016
 #
-# Description:  Interactive script that connects to a specified Nessus server using the
-#				Nessus REST API to automate mass report downloads. It has the ability to download
-#				multiple or all reports/file types/chapters and save them to a folder of
-#				your choosing. This has been tested with Nessus 5.2.5 and *should* work with
-#				Nessus 5+, YMMV.
+# Description:  Interactive script that connects to a specified Nessus 6 server using the
+#		Nessus REST API to automate mass report downloads. It has the ability to download
+#		multiple or all reports/file types/chapters and save them to a folder of
+#		your choosing. This has been tested with Nessus 6.5.5 and *should* work with
+#		Nessus 6+, YMMV.
 #
-#				File types include: .nessus v2, HTML, PDF, CSV, and NBE. 
+#		File types include: NESSUS, HTML, PDF, CSV, and DB. 
 #
-#				Chapter types include: Vulnerabilities By Plugin, Vulnerabilities By Host, 
-#				Hosts Summary (Executive), Suggested Remediations, Compliance Check (Executive), 
-#				and Compliance Check.
+#		Chapter types include: Vulnerabilities By Plugin, Vulnerabilities By Host, 
+#		Hosts Summary (Executive), Suggested Remediations, Compliance Check (Executive), 
+#		and Compliance Check.
 #
-# Requires: nokogiri (gem install nokogiri)
+# Usage: ruby ./nessus6-report-downloader.rb
 #
-# Usage: ruby ./nessus-report-downloader.rb
-#
-# Reference: http://static.tenable.com/documentation/nessus_5.0_XMLRPC_protocol_guide.pdf
+# Reference: https://<nessus-server>:8834/api
 #
 #################################################################################################
 
 require 'net/http'
-require 'nokogiri'
 require 'fileutils'
 require 'io/console'
 require 'date'
+require 'json'
+require 'openssl'
 
 # This method will download the specified file type from specified reports
-def report_download(http, headers, reports, reports_to_dl, filetypes_to_dl, chapters_to_dl, rpath)
+def report_download(http, headers, reports, reports_to_dl, filetypes_to_dl, chapters_to_dl, rpath, db_export_pw)
 	begin
 		puts "\nDownloading report(s). Please wait..."
 
 		# if all reports are selected
 		if reports_to_dl[0].eql?("all")
 			reports_to_dl.clear
-			# re-init array with all report indexs
-			reports.each_with_index do |report,idx|
-				reports_to_dl.push(idx)
+			# re-init array with all the scan ids
+			reports["scans"].each do |scan|
+				reports_to_dl.push(scan["id"].to_s)
 			end	
 		end
 		
@@ -51,54 +50,39 @@ def report_download(http, headers, reports, reports_to_dl, filetypes_to_dl, chap
 			rep = rep.strip
 			filetypes_to_dl.each do |ft|
 			
-				# different paths if csv or nbe or nessus
-				if ft.eql?("csv") or ft.eql?("nbe")
-					path = "/file/xslt/?report=#{reports[Integer(rep)].at_xpath("name").text}&xslt=#{ft}.xsl"
-				elsif ft.eql?("nessus")
-					path = "/file/report/download/?report=#{reports[Integer(rep)].at_xpath("name").text}"
-				else
-					path = "/chapter?report=#{reports[Integer(rep)].at_xpath("name").text}&format=#{ft}&chapters=#{chapters_to_dl}"
-				end
-				resp = http.get(path, headers)
+				# export report
+				puts "\n[+] Exporting scan report, scan id: " + rep + ", type: " + ft
+				path = "/scans/" + rep + "/export"
+				data = {'format' => ft, 'chapters' => chapters_to_dl, 'password' => db_export_pw}
+				resp = http.post(path, data.to_json, headers)
+				fileid = JSON.parse(resp.body)
 			
-				if ft.eql?("nessus")
-					# replaces any "/" chars with "-" so it doesn't mess up the filename
-					fname_temp = (reports[Integer(rep)].at_xpath("readableName").text).gsub("/", "-")
-			
-					# create final path/filename and write to file
-					fname = "#{rpath}/#{fname_temp}-#{reports[Integer(rep)].at_xpath("timestamp").text}.nessus"
-					dl_resp = resp
-					
-				else
-					# extract the redirect url
-					doc = Nokogiri::HTML(resp.body)
-					redirect_url = doc.at('meta[http-equiv="refresh"]')['content'][/url=(.+)/, 1]
-				
-					# need to wait for the report to finish formatting
+				# check export status
+				status_path = "/scans/" + rep + "/export/" + fileid["file"].to_s + "/status"
+				loop do
 					sleep(5)
-					dl_resp = http.get(redirect_url, headers)
-					while dl_resp.body.include?("<title>Formatting the report</title>") do
-						sleep(2)
-						dl_resp = http.get(redirect_url, headers)
-					end
-			
-					# if csv, nbe, or pdf, need to go to another url to download
-					if ft.eql?("csv") or ft.eql?("nbe") or ft.eql?("pdf")
-						dl_resp = http.get("#{redirect_url}&step=2", headers)
-					end
-				
-					# create final path/filename and write to file
-					fname_temp = redirect_url.split("=")
-					fname = "#{rpath}/#{fname_temp[1]}"
-					
+					puts "[+] Checking export status..."
+					status_resp = http.get(status_path, headers)
+					status_result = JSON.parse(status_resp.body)
+					break if status_result["status"] == "ready"
+					puts "[-] Export not ready yet, checking again in 5 secs."
 				end
-				
+
+				# download report
+				puts "[+] Report ready for download..."
+				dl_path = "/scans/" + rep + "/export/" + fileid["file"].to_s + "/download"
+				dl_resp = http.get(dl_path, headers)
+
+				# create final path/filename and write to file
+				fname_temp = dl_resp.response["Content-Disposition"].split('"')
+				fname = "#{rpath}/#{fname_temp[1]}"
+					
 				# write file
 				open(fname, 'w') { |f|
   					f.puts dl_resp.body
   				}
   			
-  				puts "Downloading report: #{fname}"
+  				puts "[+] Downloading report to: #{fname}"
   			end
 		end
 		
@@ -109,48 +93,48 @@ def report_download(http, headers, reports, reports_to_dl, filetypes_to_dl, chap
 end
 
 # This method will return a list of all the reports on the server
-def get_report_list(http, headers, seq)
+def get_report_list(http, headers)
 	begin
 		# Try and do stuff
-		path = "/report/list"
-		resp = http.post(path, 'seq=' + seq, headers)
+		path = "/scans"
+		resp = http.get(path, headers)
 
-		# extract event information
-		doc = Nokogiri::XML(resp.body)
-		root = doc.root
-		reports = root.xpath("contents/reports/report")
-		puts "Number of reports found: #{reports.count}\n\n"
+		#puts "Number of reports found: #{reports.count}\n\n"
 
-		printf("%-7s %-50s %-30s %-57s %-15s\n", "Index", "Name", "Last Updated", "UUID", "Status")
-		printf("%-7s %-50s %-30s %-57s %-15s\n", "-----", "----", "------------", "----", "------")
+		results = JSON.parse(resp.body)
+
+		printf("%-7s %-50s %-30s %-15s\n", "Scan ID", "Name", "Last Modified", "Status")
+		printf("%-7s %-50s %-30s %-15s\n", "-------", "----", "-------------", "------")
 
 		# print out all the reports
-		reports.each_with_index do |report,idx|
-			printf("%-7s %-50s %-30s %-57s %-15s\n", "[#{idx}]", report.at_xpath("readableName").text, DateTime.strptime(report.at_xpath("timestamp").text,'%s').strftime('%b %e, %Y %H:%M %Z'), report.at_xpath("name").text, report.at_xpath("status").text)
+		results["scans"].each do |scan|
+			printf("%-7s %-50s %-30s %-15s\n", scan["id"], scan["name"], DateTime.strptime(scan["last_modification_date"].to_s,'%s').strftime('%b %e, %Y %H:%M %Z'), scan["status"])
 		end
-		return reports
+		return results
 		
-	rescue StandardError => get_report_error
-		puts "\n\nError getting report list: #{get_report_error}\n\n"
+	rescue StandardError => get_scanlist_error
+		puts "\n\nError getting scan list: #{get_scanlist_error}\n\n"
 		exit
 	end
 end
 
 
-# This method will make the initial login request and set the token value to use
-def get_token(http, username, password, seq)
+# This method will make the initial login request and set the token value to use for subsequent requests
+def get_token(http, username, password)
 	begin
-		path = "/login"
-		resp = http.post(path, 'password=' + password + '&seq=' + seq + '&login=' + username)
+		path = "/session"
+		data = {'username' => username, 'password' => password}
+		resp = http.post(path, data.to_json, 'Content-Type' => 'application/json')
 
-		cookie = resp.response['set-cookie']
+		token = JSON.parse(resp.body)
 		headers = { 
 			"User-Agent" => 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.9; rv:25.0) Gecko/20100101 Firefox/25.0',
-			"Cookie" => cookie,
+			"X-Cookie" => 'token=' + token["token"],
 			"Accept" => 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
 			"Accept-Language" => 'en-us,en;q=0.5',
 			"Accept-Encoding" => 'text/html;charset=UTF-8',
-			"Cache-Control" => 'max-age=0'
+			"Cache-Control" => 'max-age=0',
+			"Content-Type" => 'application/json'
 		 }
 		return headers
 		
@@ -162,7 +146,7 @@ end
 
 ### MAIN ###
 
-puts "\nNessus Report Downloader 1.01"
+puts "\nNessus 6 Report Downloader 1.0"
 
 # Collect server info
 print "\nEnter the Nessus Server IP: "
@@ -183,14 +167,13 @@ print "Enter your Nessus Username: "
 username = gets.chomp.to_s
 print "Enter your Nessus Password (will not echo): "
 password = STDIN.noecho(&:gets).chomp.to_s
-seq = "6969"
 
 # login and get token cookie
-headers = get_token(http, username, password, seq)
+headers = get_token(http, username, password)
 
 # get list of reports
 puts "\n\nGetting report list..."
-reports = get_report_list(http, headers, seq)
+reports = get_report_list(http, headers)
 print "Enter the report(s) your want to download (comma separate list) or 'all': "
 reports_to_dl = (gets.chomp.to_s).split(",")
 
@@ -201,11 +184,11 @@ end
 
 # select file types to download
 puts "\nChoose File Type(s) to Download: "
-puts "[0] .nessus - v2 (No chapter selection)"
+puts "[0] Nessus (No chapter selection)"
 puts "[1] HTML"
 puts "[2] PDF"
 puts "[3] CSV (No chapter selection)"
-puts "[4] NBE (No chapter selection)"
+puts "[4] DB (No chapter selection)"
 print "Enter the file type(s) you want to download (comma separate list) or 'all': "
 filetypes_to_dl = (gets.chomp.to_s).split(",")
 
@@ -217,6 +200,7 @@ end
 # see which file types to download
 formats = []
 cSelect = false
+dbSelect = false
 filetypes_to_dl.each do |ft|
 	case ft.strip
 	when "all"
@@ -224,7 +208,9 @@ filetypes_to_dl.each do |ft|
 	  formats.push("html")
 	  formats.push("pdf")
 	  formats.push("csv")
-	  formats.push("nbe")
+	  formats.push("db")
+	  cSelect = true
+	  dbSelect = true
 	when "0"
 	  formats.push("nessus")
 	when "1"
@@ -236,8 +222,17 @@ filetypes_to_dl.each do |ft|
 	when "3"
 	  formats.push("csv")
 	when "4"
-	  formats.push("nbe")
+	  formats.push("db")
+	  dbSelect = true
 	end
+end
+
+# enter password used to encrypt db exports (required)
+db_export_pw = ""
+if dbSelect
+	print "\nEnter a Password to encrypt the DB export (will not echo): "
+	db_export_pw = STDIN.noecho(&:gets).chomp.to_s
+	print "\n"
 end
 
 # select chapters to include, only show if html or pdf is in file type selection
@@ -288,7 +283,7 @@ end
 
 # run report download
 if formats.count > 0
-	report_download(http, headers, reports, reports_to_dl, formats, chapters, rpath)
+	report_download(http, headers, reports, reports_to_dl, formats, chapters, rpath, db_export_pw)
 end
 
 puts "\nReport Download Completed!\n\n"
